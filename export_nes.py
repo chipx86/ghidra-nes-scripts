@@ -1641,6 +1641,9 @@ class BlockExporter:
 
         exporter = self.exporter
         listing = exporter.listing
+        ref_manager = exporter.ref_manager
+        symbol_table = exporter.symbol_table
+
         bytes_writer = self.bytes_writer
         end_addr = self.end_addr
         check_jump_tables = data_type_str in {'pointer', 'ushort'}
@@ -1665,7 +1668,26 @@ class BlockExporter:
                     comment_suffix or default_comment_suffix,
                 )
             else:
-                eol_comment = None
+                eol_comment = ''
+
+            if not eol_comment:
+                # See if this value references another address.
+                refs = ref_manager.getReferencesFrom(addr)
+
+                if refs:
+                    assert len(refs) == 1
+
+                    to_addr = refs[0].getToAddress()
+                    symbol = symbol_table.getPrimarySymbol(to_addr)
+
+                    if symbol is not None:
+                        eol_comment = (
+                            '%s [$%s]'
+                            % (self.normalize_ref(
+                                   symbol.getName(True),
+                                   exporter.get_block_name_for_addr(addr)),
+                               addr.toString())
+                        )
 
             output_bytes = True
 
