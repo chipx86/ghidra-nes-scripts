@@ -1,0 +1,2149 @@
+# -*- coding: utf-8 -*-
+# Ghidra script to export NES 6502 code to files.
+
+#@menupath Tools.Export NES
+#@category Exporters
+
+from __future__ import unicode_literals
+
+import os
+import re
+import textwrap
+import string
+from contextlib import contextmanager
+
+from ghidra.program.model.address import Address, AddressOutOfBoundsException
+from ghidra.program.model.data import (
+    Array,
+    DataType,
+    ByteDataType,
+    CharDataType,
+    DataType,
+    Enum,
+    Pointer,
+    Structure,
+    TypeDef,
+    Union,
+)
+from ghidra.program.model.listing import (
+    CodeUnit,
+    Data,
+    Function,
+    Instruction,
+    Program,
+)
+from ghidra.program.model.scalar import Scalar
+from ghidra.program.model.symbol import SymbolType, Symbol, RefType
+
+if 0:
+    import typing
+
+
+
+INVALID_LABEL_NAME_RE = re.compile(r'[^A-Za-z0-9_@.]')
+
+INDIRECT_MATCH = re.compile(
+    r'(?P<prefix>\()'
+    r'\$?(?P<addr>0x[A-Fa-f0-9]+)'
+    r'(?P<suffix>\),Y|,X\))$',
+    re.IGNORECASE)
+
+ABSOLUTE_MATCH = re.compile(
+    r'\$?'
+    r'(?P<addr>0x[A-Fa-f0-9]+)'
+    r'(?P<suffix>,(?:X|Y))?$',
+    re.IGNORECASE)
+
+SYMBOL_PLACEHOLDER_RE = re.compile(
+    r'{@sym(?:bol) (?P<addr>.+?)}'
+)
+
+SYMBOL_RE = re.compile(
+    r'(?:(?P<block>[^:]+)::)(?P<addr>[A-Fa-f0-9]+)'
+)
+
+ADDR_RE = re.compile(r'[A-Fa-f0-9]{2,4}')
+
+
+DISPLAYABLE_CHARS = set(
+    string.ascii_letters +
+    string.digits +
+    string.punctuation +
+    ' '
+)
+
+COMMENT_COLUMN = 45
+MAX_RAW_BYTES_PER_LINE = 8
+MAX_LINE_LEN = 79
+MAX_COMMENT_LINE_LEN = 77
+
+
+ACCUMULATOR_OPCODES = {
+    0x0A,
+    0x4A,
+    0x2A,
+    0x6A,
+}
+
+ZERO_PAGE_OPCODES = {
+    0xB5,  # LDA,X
+}
+
+ABSOLUTE_ADDR_OPCODES = {
+    0x6D,  # ADC
+    0x2D,  # AND
+    0x0E,  # ASL
+    0x2C,  # BIT
+    0xCD,  # CMP
+    0xEC,  # CPX
+    0xCC,  # CPY
+    0xCE,  # DEC
+    0x4D,  # EOR
+    0xEE,  # INC
+    0xAD,  # LDA
+    0xAE,  # LDX
+    0xAC,  # LDY
+    0x4E,  # LSR
+    0x0D,  # ORA
+    0x2E,  # ROL
+    0x6E,  # ROR
+    0xED,  # SBC
+    0x8D,  # STA
+    0x8E,  # STX
+    0x8C,  # STY
+}
+
+
+def get_addr_for_eol_comment(
+    addr,  # type: Address
+):  # type: (...) -> str
+    return '[$%s]' % addr.toString().rsplit(':', 1)[-1]
+
+
+def get_data_type_str(
+    data_type,  # type: DataType
+):  # type: (...) -> str
+    base_data_type = data_type
+
+    while isinstance(base_data_type, TypeDef):
+        base = base_data_type.getBaseDataType()
+
+        if base is not None or base == base_data_type:
+            break
+
+        base_data_type = base
+
+    if isinstance(base_data_type, Enum):
+        return base_data_type.getName()
+    elif isinstance(base_data_type, CharDataType):
+        return 'char'
+    elif isinstance(base_data_type, ByteDataType):
+        return 'byte'
+    else:
+        return data_type.getName()
+
+
+class BytesWriter:
+    MAX_PER_LINE = 16
+
+    def __init__(
+        self,
+        writer,  # type: FileWriter
+    ):  # type: (...) -> None
+        self.writer = writer
+
+        self.buffer = []           # type: list[int | None]
+        self.start_addr = None     # type: Address | None
+        self.cur_data_type = None  # type: DataType | None
+        self.labeled = False       # type: bool
+        self.cur_size = 0          # type: int
+
+    def append(
+        self,
+        value,                    # type: int
+        default_start_addr=None,  # type: Address | None
+        size=1,                   # type: int
+        eol_comment=None,         # type: str | None
+        data_type=None,           # type: DataType | None
+        labeled=False,            # type: bool
+    ):  # type: (...) -> None
+        assert value is None or isinstance(value, int), (
+            'value was %r, not None or int' % value
+        )
+
+        if self.start_addr is None:
+            self.start_addr = default_start_addr
+
+        if data_type is not None:
+            data_type_str = data_type.getName()
+        else:
+            data_type_str = None
+
+        if (eol_comment or
+            data_type != self.cur_data_type or
+            size != self.cur_size or
+            #labeled != self.labeled):
+            (labeled and not self.labeled)):
+            # Distinguish this from previous bytes.
+            flushed = self.flush()
+
+            if flushed and (not labeled or data_type != self.cur_data_type):
+                self.writer.write_blank_line()
+
+        buffer = self.buffer
+        self.cur_data_type = data_type
+        self.cur_size = size
+        self.labeled = labeled
+
+        if value is None:
+            buffer.append(None)
+        elif size == 1:
+            buffer.append(value & 0xFF)
+        elif size == 2:
+            buffer.append(value & 0xFFFF)
+        else:
+            assert False, (
+                'Unsupported value for BytesWriter.append(): %r'
+                % value
+            )
+
+        if (eol_comment or
+            (len(buffer) * size) >= self.MAX_PER_LINE or
+            isinstance(data_type, Enum)):
+            self.flush(eol_comment=eol_comment)
+
+    def flush(
+        self,
+        eol_comment=None  # type: str | None
+    ):  # type: (...) -> bool
+        buffer = self.buffer
+
+        if not buffer:
+            return False
+
+        start_addr = self.start_addr
+        data_type = self.cur_data_type
+        assert data_type is not None
+
+        data_type_str = data_type.getName()
+        assert data_type_str
+
+
+        if data_type_str == 'char':
+            # This is a char. Output as strings.
+            groups = self._group_string(buffer)
+            data_text = [
+                'db',
+                ','.join(
+                    self._format_string_group(group)
+                    for group in groups
+                ),
+            ]
+        elif isinstance(data_type, Enum):
+            assert self.cur_size == 1
+
+            data_text = [
+                'db',
+                ','.join(
+                    self._format_enum_value(b, data_type)
+                    for b in buffer
+                ),
+            ]
+        elif self.cur_size == 2:
+            # This is a word (pointer, short, ushort). Output as words.
+            data_text = [
+                'dw',
+                ','.join(
+                    self._format_word(word)
+                    for word in buffer
+                ),
+            ]
+        elif len(buffer) < 8 or not data_type_str.startswith('undefined'):
+            # These are bytes (or similar), but there's not too many. Output
+            # as byte definitions.
+            data_text = [
+                'db',
+                ','.join(
+                    self._format_byte(b)
+                    for b in buffer
+                )
+            ]
+        else:
+            # Output anything else as hex.
+            data_text = [
+                'hex',
+                ' '.join(
+                    '{:02x}'.format(b or 0)
+                    for b in buffer
+                )
+            ]
+
+        if not eol_comment and start_addr:
+            eol_comment = '%s %s' % (
+                get_addr_for_eol_comment(start_addr),
+                data_type_str,
+            )
+
+        self.writer.write_code(data_text,
+                               eol_comment=eol_comment)
+        self.buffer = []
+        self.start_addr = None
+
+        return True
+
+    def _group_string(
+        self,
+        buffer,  # type: list[int | None]
+    ):  # type: (...) -> list[tuple[bool, list[int]]]
+        cur_group = []             # type: list[int]
+        cur_is_displayable = True  # type: bool
+
+        result = [(cur_is_displayable, cur_group)]
+
+        for b in buffer:
+            if b is None:
+                b = 0
+                is_displayable = False
+            else:
+                is_displayable = chr(b) in DISPLAYABLE_CHARS
+
+            if cur_is_displayable != is_displayable:
+                cur_group = []
+                cur_is_displayable = is_displayable
+                result.append((is_displayable, cur_group))
+
+            cur_group.append(b)
+
+        return [
+            group
+            for group in result
+            if group[1]
+        ]
+
+    def _format_string_group(
+        self,
+        group,  # type: tuple[bool, list[int]]
+    ):  # type: (...) -> str
+        if group[0]:
+            return '"%s"' % ''.join(
+                chr(b)
+                for b in group[1]
+            ).replace('"', '\\"')
+        else:
+            return ','.join(
+                self._format_byte(b)
+                for b in group[1]
+            )
+
+    def _format_byte(
+        self,
+        value,  # type: int | None
+    ):  # type: (...) -> str
+        return '${:02x}'.format(value or 0)
+
+    def _format_char(
+        self,
+        value,  # type: int | None
+    ):  # type: (...) -> str
+        return chr(value or 0)
+
+    def _format_enum_value(
+        self,
+        value,      # type: int | None
+        data_type,  # type: Enum
+    ):  # type: (...) -> str
+        if value is None:
+            return '$00'
+
+        if data_type.contains(value):
+            return data_type.getName(value)
+
+        return self._format_byte(value)
+
+    def _format_word(
+        self,
+        values,  # type: int | None
+    ):  # type: (...) -> str
+        return '${:04x}'.format(values or 0)
+
+
+class FileWriter(object):
+    ext = None      # type: str | None
+    dirname = None  # type: str | None
+
+    TEMPLATE_RE = re.compile(
+        r'{{@(?P<type>SYMBOL):(?P<value>.+?)@}}'
+    )
+
+    def __init__(
+        self,
+        base_path,     # str
+        block_name,    # str
+        program_name,  # str
+    ):  # type: (...) -> None
+        self.base_path = base_path
+        self.block_name = block_name
+        self.program_name = program_name
+
+        self.blank_line_count = 0  # type: int
+        self.fp = None             # type: typing.IO | None
+
+    @contextmanager
+    def open(self):  # typing.Generator
+        assert self.ext
+        assert self.dirname
+
+        filename = '%s.%s' % (self.block_name, self.ext)
+        print('Writing %s...' % filename)
+
+        with open(os.path.join(self.base_path, self.dirname,
+                               filename), 'w') as fp:
+            self.fp = fp
+
+            try:
+                yield
+            finally:
+                self.fp = None
+
+    def new_code_unit(self):  # type: (...) -> None
+        pass
+
+    def write_line(
+        self,
+        line,  # type: str
+    ):  # type: (...) -> None
+        fp = self.fp
+        assert fp is not None
+
+        self.blank_line_count = 0
+        fp.write(self.format_line(self.process_line(line)))
+
+    def write_lines(
+        self,
+        lines,  # type: list[str]
+    ):  # type: (...) -> None
+        fp = self.fp
+        assert fp is not None
+
+        self.blank_line_count = 0
+
+        for line in lines:
+            fp.write(self.process_line(line).encode('utf-8'))
+            fp.write('\n')
+
+    def write_line_with_eol_comment(
+        self,
+        line,         # type: str
+        eol_comment,  # type: str | None
+    ):  # type: (...) -> None
+        if eol_comment:
+            padding = ' ' * max(1, COMMENT_COLUMN - len(line) - 1)
+            line_prefix = '%s%s' % (line, padding)
+
+            self.write_lines(textwrap.wrap(
+                eol_comment,
+                break_long_words=False,
+                break_on_hyphens=False,
+                initial_indent='%s; ' % line_prefix,
+                subsequent_indent='%s; ' % (' ' * len(line_prefix)),
+                width=MAX_COMMENT_LINE_LEN))
+        else:
+            self.write_line(line)
+
+    def write_blank_line(
+        self,
+        count=1,  # type: int
+    ):  # type: (...) -> None
+        fp = self.fp
+        assert fp is not None
+
+        new_blank_line_count = max(0, count - self.blank_line_count)
+
+        if new_blank_line_count > 0:
+            # We don't use write_lines() here because want to go through
+            # line processing per-line, rather than treating as an atomic
+            # set of lines.
+            for i in range(new_blank_line_count):
+                self.write_line('')
+
+            self.blank_line_count = new_blank_line_count
+
+    def write_anchor(
+        self,
+        name,  # type: str
+    ):  # type: (...) -> None
+        pass
+
+    def write_label(
+        self,
+        label_name,        # type: str
+        is_local=False,    # type: bool
+        eol_comment=None,  # type: str | None
+    ):  # type: (...) -> None
+        self.write_line_with_eol_comment(
+            self.format_label(label_name,
+                              is_local=is_local),
+            eol_comment=eol_comment,
+        )
+
+    def write_code(
+        self,
+        code,                    # type: list[str]
+        instruction_bytes=None,  # type: list[str] | None
+        eol_comment=None,        # type: str | None
+    ):  # type: (...) -> None
+        self.write_line_with_eol_comment(
+            self.process_line(self.format_code(code)),
+            eol_comment=eol_comment,
+        )
+
+    def write_equs(
+        self,
+        equs,  # type: list[tuple[str, str]]
+    ):  # type: (...) -> None
+        self.write_lines(self.format_equs(equs))
+
+    def write_comment(
+        self,
+        comment,                 # type: str
+        indent='',               # type: str
+        leading_blank=1,         # type: int
+        use_plate_syntax=False,  # type: bool
+    ):  # type: (...) -> None
+        if not comment or not comment.strip():
+            return
+
+        self.write_blank_line(leading_blank)
+
+        if use_plate_syntax:
+            bullet_extra = '=' * (MAX_LINE_LEN - len(indent) - 3)
+        else:
+            bullet_extra = ''
+
+        norm_lines = [  # type: list[str]
+            ';%s' % bullet_extra,
+        ]
+
+        lines = comment.splitlines()
+
+        # Trim away any leading or trailing blank lines.
+        start = 0
+        end = len(lines)
+
+        for line in lines:
+            if line.strip() != '':
+                break
+
+            start += 1
+
+        for line in reversed(lines):
+            if line.strip() != '':
+                break
+
+            end -= 1
+
+        # Generate the comments to output.
+        for line in lines[start:end]:
+            stripped_line = line.lstrip()
+            line_prefix = '; %s' % (' ' * (len(line) - len(stripped_line)))
+
+            if stripped_line:
+                norm_lines += textwrap.wrap(
+                    stripped_line,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                    initial_indent=line_prefix,
+                    subsequent_indent=line_prefix,
+                    width=MAX_COMMENT_LINE_LEN)
+            else:
+                norm_lines.append(line_prefix.rstrip())
+
+        norm_lines.append(';%s' % bullet_extra)
+
+        self.write_comment_lines(norm_lines,
+                                 indent=indent,
+                                 use_plate_syntax=use_plate_syntax)
+
+    def write_comment_lines(
+        self,
+        lines,             # type: list[str]
+        indent,            # type: str
+        use_plate_syntax,  # type: bool
+    ):  # type: (...) -> None
+        self.write_lines(lines)
+
+    def format_line(
+        self,
+        line,  # type: str
+    ):  # type: (...) -> str
+        return '%s\n' % line
+
+    def format_code(
+        self,
+        code_parts,  # type: list[str]
+    ):  # type: (...) -> str
+        raise NotImplementedError
+
+    def format_equs(
+        self,
+        equs,  # type: list[tuple[str, str]]
+    ):  # type: (...) -> list[str]
+        raise NotImplementedError
+
+    def format_label(
+        self,
+        label_name,  # type: str
+        is_local,    # type: bool
+    ):  # type: (...) -> str
+        raise NotImplementedError
+
+    def process_line(
+        self,
+        line,  # type: str
+    ):  # type: (...) -> str
+        return self.TEMPLATE_RE.sub(self.process_template_var, line)
+
+    def process_template_var(
+        self,
+        m,  # type: re.Match
+    ):  # type: (...) -> str
+        raise NotImplementedError
+
+
+class TextFileWriter(FileWriter):
+    ext = 'asm'
+    dirname = 'src'
+
+    def write_line_with_eol_comment(
+        self,
+        line,         # type: str
+        eol_comment,  # type: str | None
+    ):  # type: (...) -> None
+        if eol_comment:
+            padding = ' ' * max(1, COMMENT_COLUMN - len(line) - 1)
+            line_prefix = '%s%s' % (line, padding)
+
+            self.write_lines(textwrap.wrap(
+                eol_comment,
+                break_long_words=False,
+                break_on_hyphens=False,
+                initial_indent='%s; ' % line_prefix,
+                subsequent_indent='%s; ' % (' ' * len(line_prefix)),
+                width=MAX_COMMENT_LINE_LEN))
+        else:
+            self.write_line(line)
+
+    def write_comment_lines(
+        self,
+        lines,             # type: list[str]
+        indent,            # type: str
+        use_plate_syntax,  # type: bool
+    ):  # type: (...) -> None
+        fp = self.fp
+        assert fp is not None
+
+        self.write_lines([
+            '%s%s' % (indent, line)
+            for line in lines
+        ])
+
+    def format_code(
+        self,
+        code_parts,  # type: list[str]
+    ):  # type: (...) -> str
+        return '    %s' % ' '.join(code_parts)
+
+    def format_equs(
+        self,
+        equs,  # type: list[tuple[str, str]]
+    ):  # type: (...) -> list[str]
+        max_len = max(
+            50,
+            max(
+                len(parts[0])
+                for parts in equs
+            )
+        )
+
+        return [
+            '%s EQU %s' % (name.ljust(max_len), value)
+            for name, value in equs
+        ]
+
+    def format_label(
+        self,
+        label_name,  # type: str
+        is_local,    # type: bool
+    ):  # type: (...) -> str
+        if is_local:
+            return '  %s:' % label_name
+        else:
+            return '%s:' % label_name
+
+    def process_template_var(
+        self,
+        m,  # type: re.Match
+    ):  # type: (...) -> str
+        if m.group('type') == 'SYMBOL':
+            return m.group('value').split('::', 1)[1]
+
+        assert False
+
+
+class HTMLString(unicode):
+    __slots__ = ()
+
+    is_html = True
+
+    def __unicode__(self):
+        return self
+
+    def __str__(self):
+        return self
+
+
+class HTMLFileWriter(FileWriter):
+    ext = 'html'
+    dirname = 'html'
+
+    CSS = textwrap.dedent("""
+         @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:ital,wght@0,100..700;1,100..700&display=swap');
+
+        body {
+          background: #1c212d;
+          color: white;
+          padding: 0.5em;
+        }
+
+        body, * {
+          font-family: "Roboto Mono", monospace;
+          font-size: 9.5pt;
+          font-style: normal;
+        }
+
+        a:link,
+        a:visited {
+          color: #9bdeff;
+        }
+
+        pre {
+          display: grid;
+          grid-template-columns: minmax(70ch, max-content) 1fr;
+          gap: 0 4em;
+          margin: 0;
+          padding: 0;
+        }
+
+        .equs {
+          display: grid;
+          grid-template-columns: minmax(50ch, max-content) min-content auto;
+          gap: 0 1em;
+        }
+
+        .l {
+          display: grid;
+          grid-template-columns: subgrid;
+          min-height: 1lh;
+        }
+
+        .c,
+        .cp,
+        .equs,
+        .l {
+          grid-column: 1 / -1;
+        }
+
+        .cp {
+          color: #6fafb5;
+        }
+
+        .c {
+          margin-left: 4em;
+        }
+
+        .c, .ce {
+          color: #8aa9ac;
+        }
+
+        .ce {
+          text-wrap: wrap;
+          text-indent: 2ch hanging;
+        }
+
+        .lla {
+          margin-left: 2em;
+        }
+
+        .la,
+        .lla {
+          font-weight: bold;
+        }
+
+        .la,
+        .la:link,
+        .la:visited {
+          color: #e8e801;
+        }
+
+        .lla,
+        .lla:link,
+        .lla:visited {
+          color: #caca00;
+        }
+
+        .i {
+          color: #f26969;
+          margin-left: 4em;
+          min-width: 3em;
+        }
+
+        .o {
+          color: #e3e3e3;
+          margin-left: 1ch;
+        }
+    """)
+
+    @contextmanager
+    def open(self):  # typing.Generator
+        with super(HTMLFileWriter, self).open():
+            fp = self.fp
+            assert fp is not None
+
+            title = '{block_name} - {program}'.format(
+                block_name=self.block_name,
+                program=self.program_name,
+            )
+
+            fp.write(
+                '<!DOCTYPE html>\n'
+                '\n'
+                '<html>\n'
+                ' <head>\n'
+                '  <title>{title}</title>\n'
+                '  <meta http-equiv="Content-Type"'
+                ' content="text/html; charset=utf-8">\n'
+                '  <style>\n'
+                '{css}\n'
+                '  </style>\n'
+                ' </head>\n'
+                ' <body>\n'
+                '  <pre>\n'
+                .format(css=self.CSS,
+                        title=title)
+            )
+
+            yield
+
+            fp.write(
+                '</pre>\n'
+                ' </body>\n'
+                '</html>\n'
+            )
+
+    def new_code_unit(self):  # type: (...) -> None
+        fp = self.fp
+        assert fp is not None
+
+        fp.write('</pre><pre>')
+
+    def write_anchor(
+        self,
+        name,  # type: str
+    ):  # type: (...) -> None
+        fp = self.fp
+        assert fp is not None
+
+        fp.write('<a name="%s"></a>' % self._escape(name))
+
+    def write_line_with_eol_comment(
+        self,
+        line,         # type: str
+        eol_comment,  # type: str | None
+    ):  # type: (...) -> None
+        if eol_comment:
+            self.write_line(HTMLString(
+                '{line}<span class="ce">; {comment}</span>'
+                .format(line=self._escape(line),
+                        comment=self._escape(eol_comment))
+            ))
+        else:
+            self.write_line(line)
+
+    def write_comment_lines(
+        self,
+        lines,  # type: list[str]
+        indent,            # type: str
+        use_plate_syntax,  # type: bool
+    ):  # type: (...) -> None
+        fp = self.fp
+        assert fp is not None
+
+        if use_plate_syntax:
+            css_class = 'cp'
+        else:
+            css_class = 'c'
+
+        fp.write('<div class="%s">' % css_class)
+        self.write_lines([
+            self._escape(line)
+            for line in lines
+        ])
+        fp.write('</div>')
+
+    def write_equs(
+        self,
+        equs,  # type: list[tuple[str, str]]
+    ):  # type: (...) -> None
+        fp = self.fp
+        assert fp is not None
+
+        fp.write('<div class="equs">')
+        super(HTMLFileWriter, self).write_equs(equs)
+        fp.write('</div>')
+
+    def format_line(
+        self,
+        line,  # type: str
+    ):  # type: (...) -> str
+        return HTMLString(
+            '<span class="l">{line}</span>\n'
+            .format(line=self._escape(line))
+        )
+
+    def format_code(
+        self,
+        code_parts,  # type: list[str]
+    ):  # type: (...) -> str
+        result = '<span class="i">%s</span>' % self._escape(code_parts[0])
+
+        if len(code_parts) > 1:
+            result = (
+                '%s <span class="o">%s</span>'
+                % (
+                    result,
+                    ' '.join(
+                        self._escape(part)
+                        for part in code_parts[1:]
+                    )
+                )
+            )
+
+        return HTMLString('<span>%s</span>' % result)
+
+    def format_equs(
+        self,
+        equs,  # type: list[tuple[str, str]]
+    ):  # type: (...) -> list[str]
+        return [
+            HTMLString(
+                '<div class="n">%s</div> '
+                '<div class="i">EQU</div> '
+                '<div class="v">%s</div>\n'
+                % (
+                    self._escape(name),
+                    self._escape(value),
+                )
+            )
+            for name, value in equs
+        ]
+
+    def format_label(
+        self,
+        label_name,  # type: str
+        is_local,    # type: bool
+    ):  # type: (...) -> str
+        if is_local:
+            cssclass = 'lla'
+        else:
+            cssclass = 'la'
+
+        return HTMLString(
+            '<a name="{label}" href="#{label}" class="{cssclass}">{label}:</a>'
+            .format(cssclass=cssclass,
+                    label=self._escape(label_name))
+        )
+
+    def process_line(
+        self,
+        line,  # type: str
+    ):  # type: (...) -> str
+        return HTMLString(self.TEMPLATE_RE.sub(self.process_template_var,
+                                               line))
+
+    def process_template_var(
+        self,
+        m,  # type: re.Match
+    ):  # type: (...) -> str
+        if m.group('type') == 'SYMBOL':
+            value = m.group('value')
+
+            block_name, ref = value.split('::', 1)
+
+            if block_name == self.block_name:
+                target = '#%s' % ref
+            else:
+                target = '%s.html#%s' % (block_name, ref)
+
+            return HTMLString('<a href="%s">%s</a>' % (target, ref))
+
+        assert False
+
+    def _escape(
+        self,
+        text,  # type: str
+    ):  # type: (...) -> HTMLString
+        if hasattr(text, 'is_html'):
+            return text
+
+        return HTMLString(
+            text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+        )
+
+
+class MultiFileWriter(FileWriter):
+    def __init__(
+        self,
+        *args,
+        **kwargs
+    ):  # type: (...) -> None
+        super(MultiFileWriter, self).__init__(*args, **kwargs)
+
+        self.asm_writer = TextFileWriter(*args, **kwargs)
+        self.html_writer = HTMLFileWriter(*args, **kwargs)
+
+    @contextmanager
+    def open(self):  # typing.Generator
+        with self.asm_writer.open():
+            with self.html_writer.open():
+                yield
+
+    def new_code_unit(
+        self,
+        *args,
+        **kwargs
+    ):  # type: (...) -> None
+        self.asm_writer.new_code_unit(*args, **kwargs)
+        self.html_writer.new_code_unit(*args, **kwargs)
+
+    def write_line(
+        self,
+        *args,
+        **kwargs
+    ):  # type: (...) -> None
+        self.asm_writer.write_line(*args, **kwargs)
+        self.html_writer.write_line(*args, **kwargs)
+
+    def write_lines(
+        self,
+        *args,
+        **kwargs
+    ):  # type: (...) -> None
+        self.asm_writer.write_lines(*args, **kwargs)
+        self.html_writer.write_lines(*args, **kwargs)
+
+    def write_line_with_eol_comment(
+        self,
+        *args,
+        **kwargs
+    ):  # type: (...) -> None
+        self.asm_writer.write_line_with_eol_comment(*args, **kwargs)
+        self.html_writer.write_line_with_eol_comment(*args, **kwargs)
+
+    def write_blank_line(
+        self,
+        *args,
+        **kwargs
+    ):  # type: (...) -> None
+        self.asm_writer.write_blank_line(*args, **kwargs)
+        self.html_writer.write_blank_line(*args, **kwargs)
+
+    def write_code(
+        self,
+        *args,
+        **kwargs
+    ):  # type: (...) -> None
+        self.asm_writer.write_code(*args, **kwargs)
+        self.html_writer.write_code(*args, **kwargs)
+
+    def write_equs(
+        self,
+        *args,
+        **kwargs
+    ):  # type: (...) -> None
+        self.asm_writer.write_equs(*args, **kwargs)
+        self.html_writer.write_equs(*args, **kwargs)
+
+    def write_comment(
+        self,
+        *args,
+        **kwargs
+    ):  # type: (...) -> None
+        self.asm_writer.write_comment(*args, **kwargs)
+        self.html_writer.write_comment(*args, **kwargs)
+
+    def write_label(
+        self,
+        *args,
+        **kwargs
+    ):  # type: (...) -> None
+        self.asm_writer.write_label(*args, **kwargs)
+        self.html_writer.write_label(*args, **kwargs)
+
+
+class BlockExporter:
+    def __init__(
+        self,
+        block,     # type: Block
+        exporter,  # type: Exporter
+    ):  # type: (...) -> None
+        self.block = block
+        self.block_name = block.getName()
+        self.exporter = exporter
+        self.end_addr = block.getEnd()
+        self.is_block_initialized = block.isInitialized()
+        self.prev_code_unit = None
+
+    def export(
+        self,
+        writer,  # type: FileWriter
+    ):  # type: (...) -> None
+        block = self.block
+        exporter = self.exporter
+
+        block_name = block.getName()
+        start_addr = block.getStart()
+        end_addr = self.end_addr
+
+        norm_start_addr = exporter.normalize_address(start_addr)
+        norm_end_addr = exporter.normalize_address(end_addr)
+
+        bytes_writer = BytesWriter(writer)
+        self.bytes_writer = bytes_writer
+
+        writer.write_comment(
+            comment=(
+                '{program}\n'
+                '\n'
+                '{block_name} (${start_addr} - ${end_addr})'
+                .format(block_name=block_name,
+                        program=exporter.program_name,
+                        start_addr=norm_start_addr,
+                        end_addr=norm_end_addr)
+            ),
+            leading_blank=0,
+            use_plate_syntax=True,
+        )
+        writer.write_blank_line()
+        writer.write_line('BASE $%s' % norm_start_addr)
+        writer.write_blank_line()
+
+        cur_addr = start_addr
+
+        while cur_addr is not None and cur_addr.compareTo(end_addr) <= 0:
+            processed_len = self.export_addr(
+                addr=cur_addr,
+                bytes_writer=bytes_writer,
+                writer=writer)
+
+            if processed_len <= 0:
+                processed_len = 1
+
+            if cur_addr == end_addr:
+                break
+
+            try:
+                next_addr = cur_addr.addNoWrap(processed_len)
+
+                if next_addr.compareTo(cur_addr) <= 0:
+                    cur_addr = None
+                else:
+                    cur_addr = next_addr
+            except AddressOutOfBoundsException:
+                cur_addr = None
+            except Exception as e:
+                print(e)
+                cur_addr = None
+
+        self.bytes_writer.flush()
+
+    def export_addr(
+        self,
+        addr,          # type: Address
+        bytes_writer,  # type: BytesWriter
+        writer,        # type: FileWriter
+    ):  # type: (...) -> int
+        code_unit = self.exporter.listing.getCodeUnitAt(addr)
+
+        if isinstance(code_unit, Instruction):
+            processed_len = self.export_instruction(code_unit, addr, writer)
+        elif isinstance(code_unit, Data):
+            processed_len = self.export_data(code_unit, addr, writer)
+        else:
+            self.bytes_writer.append(exporter.memory.getByte(addr))
+            processed_len = 1
+
+        return processed_len
+
+    def export_instruction(
+        self,
+        code_unit,  # type: CodeUnit
+        addr,       # type: Address
+        writer      # type: FileWriter
+    ):  # type: (...) -> int
+        assert addr == code_unit.getAddress()
+
+        exporter = self.exporter
+        listing = exporter.listing
+
+        self.bytes_writer.flush()
+
+        self.export_labels_and_comments(addr, writer, is_inner=True)
+
+#        symbol = exporter.find_symbol_for_address(addr)
+
+#        if symbol:
+#            if not listing.getComment(CodeUnit.PLATE_COMMENT, addr):
+#                fp.write('\n')
+#
+#            fp.write('%s:\n' % symbol)
+
+        # Generate the human-readable instruction.
+        instruction_bytes, code = self.generate_code(code_unit, addr, writer)
+        writer.write_code(
+            code=code,
+            instruction_bytes=instruction_bytes,
+            eol_comment=self.process_comment(
+                listing.getComment(CodeUnit.EOL_COMMENT, addr)),
+        )
+
+        # Output any post-code comment.
+        self.export_comment(listing.getComment(CodeUnit.POST_COMMENT, addr),
+                            writer,
+                            indent='    ')
+
+        return code_unit.getLength()
+
+    def export_data(
+        self,
+        code_unit,  # type: CodeUnit
+        addr,       # type: Address
+        writer,     # type: FileWriter
+    ):  # type: (...) -> int
+        data = self.exporter.listing.getDataContaining(addr)
+
+        return self.export_data_tree(data or code_unit, writer)
+
+    def export_labels_and_comments(
+        self,
+        addr,           # type: Address
+        writer,         # type: FileWriter
+        is_inner=False  # type: bool
+    ):  # type: (...) -> bool
+        exporter = self.exporter
+        listing = exporter.listing
+
+        # Output any plate comment.
+        plate_comment = listing.getComment(CodeUnit.PLATE_COMMENT, addr)
+        pre_comment = listing.getComment(CodeUnit.PRE_COMMENT, addr)
+        pending_labels = exporter.get_labels_at_addr(addr)
+        func = exporter.func_manager.getFunctionAt(addr)
+
+        if plate_comment or pre_comment or pending_labels:
+            self.bytes_writer.flush()
+
+        if is_inner:
+            pre_comment_indent = ' ' * 4
+        else:
+            pre_comment_indent = ''
+
+        if func is not None:
+            writer.new_code_unit()
+            writer.write_anchor(addr)
+
+            if not plate_comment:
+                plate_comment = self._get_default_func_comment(func)
+
+            plate_comment = self._add_xrefs_to_comment(plate_comment, addr)
+
+        self.export_comment(plate_comment,
+                            writer=writer,
+                            leading_blank=2,
+                            use_plate_syntax=True)
+
+        if func is None:
+            # Write this comment at this location, before any labels.
+            if pending_labels and not pending_labels[0].startswith('@'):
+                pre_comment = self._add_xrefs_to_comment(pre_comment or '',
+                                                         addr)
+
+            self.export_comment(pre_comment,
+                                writer=writer,
+                                indent=pre_comment_indent)
+
+        if pending_labels:
+            if not plate_comment and not pre_comment:
+                writer.write_blank_line()
+
+            eol_comment = '[$%s]' % addr.toString().split(':')[-1]
+
+            for label in pending_labels:
+                label_name = exporter.sanitize_label_name(label)
+
+                if label_name:
+                    writer.write_label(
+                        label_name,
+                        is_local=label_name.startswith('@'),
+                        eol_comment=eol_comment,
+                    )
+
+                    eol_comment = ''
+
+        if func is not None:
+            # Write this comment at this location, after the function label.
+            self.export_comment(pre_comment,
+                                writer=writer,
+                                indent=pre_comment_indent,
+                                leading_blank=0)
+
+        return bool(plate_comment or pre_comment or pending_labels)
+
+    def export_comment(
+        self,
+        comment,                # type: str | None
+        writer,                 # type: FileWriter
+        indent='',              # type: str
+        leading_blank=1,        # type: int
+        use_plate_syntax=False  # type: bool
+    ):  # type: (...) -> None
+        if not comment or not comment.strip():
+            return
+
+        comment = self.process_comment(comment)
+
+        if not comment or not comment.strip():
+            return
+
+        writer.write_comment(comment=comment,
+                             indent=indent,
+                             leading_blank=leading_blank,
+                             use_plate_syntax=use_plate_syntax)
+
+    def generate_code(
+        self,
+        code_unit,  # type: CodeUnit
+        addr,       # type: Address
+        writer,     # type: FileWriter
+    ):  # type: (...) -> list[tuple[str, str]]
+        exporter = self.exporter
+
+        raw_instruction_bytes = [
+            b & 0xFF
+            for b in code_unit.getBytes()
+        ]
+
+        instruction_bytes = [
+            '{:02x}'.format(b)
+            for b in raw_instruction_bytes
+        ]
+
+        code = []
+
+        mnemonic = code_unit.getMnemonicString().upper()
+        is_accumulator = (
+            instruction_bytes and
+            instruction_bytes[0] in ACCUMULATOR_OPCODES
+        )
+
+        operand_strings = []
+
+        if is_accumulator and code_unit.getLength() == 1:
+            code.append(mnemonic.ljust(3))
+        elif mnemonic == 'IGN':
+            assert code_unit.getNumOperands()
+
+            ops = code_unit.getBytes()
+
+            code += [
+                'db',
+                ','.join(
+                    '$%02x' % (op & 0xFF)
+                    for op in ops
+                ),
+            ]
+        else:
+            for i in range(code_unit.getNumOperands()):
+                op_str = None
+                default_op_rep = code_unit.getDefaultOperandRepresentation(i)
+
+                norm_default_op_rep = default_op_rep.upper()
+
+                if norm_default_op_rep.endswith(',X'):
+                    index_suffix = ',X'
+                elif norm_default_op_rep.endswith(',Y'):
+                    index_suffix = ',Y'
+                else:
+                    index_suffix = ''
+
+                primary_symbol = None
+
+                for obj in code_unit.getOpObjects(i):
+                    if isinstance(obj, Address):
+                        symbol = exporter.find_symbol_for_address(obj)
+
+                        if symbol:
+                            primary_symbol = symbol
+                            break
+                    elif isinstance(obj, Scalar):
+                        if default_op_rep.startswith('#'):
+                            scalar_value = obj.getValue()
+
+                            if (abs(scalar_value) <= 0xFF and
+                                not mnemonic.startswith('j')):
+                                op_str = '#${:02x}'.format(
+                                    scalar_value & 0xff)
+                            else:
+                                op_str = '#${:04x}'.format(
+                                    scalar_value & 0xffff)
+
+                            break
+
+                if primary_symbol:
+                    symbol_ref = self.normalize_ref(
+                        exporter.sanitize_label_name(primary_symbol[1]),
+                        primary_symbol[0])
+
+                    if (norm_default_op_rep.startswith('(') and
+                        norm_default_op_rep.endswith(',X)')):
+                        op_str = '({},X)'.format(symbol_ref)
+                    elif (norm_default_op_rep.startswith('(') and
+                          norm_default_op_rep.endswith('),Y')):
+                        op_str = '({}),Y'.format(symbol_ref)
+                    else:
+                        op_str = '%s%s' % (symbol_ref, index_suffix)
+                elif not op_str:
+                    op_str = \
+                        self.normalize_operand_addressing(default_op_rep)
+
+                # Make sure Zero Page mode isn't used for these instructions.
+
+                if raw_instruction_bytes[0] in ABSOLUTE_ADDR_OPCODES:
+                    op_str = 'a:%s' % op_str
+
+                #assert op_str != 'Area_CurrentArea', raw_instruction_bytes
+
+                operand_strings.append(op_str)
+
+            code.append(mnemonic.ljust(3))
+            code += operand_strings
+
+        return instruction_bytes, code
+
+    def normalize_operand_addressing(
+        self,
+        op_rep,       # type: str
+    ):  # type: (...) -> str
+        is_abs = ABSOLUTE_MATCH.match(op_rep)
+        m = is_abs or INDIRECT_MATCH.match(op_rep)
+
+        if not m:
+            return self.normalize_ref(op_rep)
+
+        prefix = m.groupdict().get('prefix', '')
+        suffix = (m.group('suffix') or '').upper()
+        addr = m.group('addr')
+
+        if addr.startswith('0x'):
+            addr = addr[2:]
+
+            if len(addr) < 4:
+                addr = addr.rjust(4, '0')
+
+            addr = self.get_ref_to_addr(addr)
+
+        addr = self.normalize_ref(addr)
+
+        return '%s%s%s' % (prefix, addr, suffix)
+
+    def process_comment(
+        self,
+        comment,  # type: str | None
+    ):  # type: (...) -> str | None
+        if not comment:
+            return comment
+
+        return SYMBOL_PLACEHOLDER_RE.sub(
+            lambda m: (
+                self.get_ref_to_addr(m.group('addr')) or
+                m.group('addr')
+            ),
+            comment.rstrip())
+
+    def get_ref_to_addr(
+        self,
+        addr_str,  # type: str
+    ):  # type: (...) -> str
+        addr = None             # type: Address | None
+        fallback_symbol = None  # type: tuple | None
+
+        m = SYMBOL_RE.match(addr_str)
+
+        if m:
+            block_name = m.group('block')
+        else:
+            block_name = None
+
+        norm_addr = addr_str.lower()
+        #norm_addr = exporter.normalize_address_from_string(addr_str)
+
+        if norm_addr:
+            fallback_symbol = (
+                exporter.addr_to_label.get(norm_addr, [None])[0] or
+                exporter.addr_to_symbol.get(norm_addr, [None])[0]
+            )
+
+            if not fallback_symbol and SYMBOL_RE.match(norm_addr) and addr:
+                addr = exporter.default_addr_space.getAddress(norm_addr)
+
+                if addr:
+                    fallback_symbol = exporter.find_symbol_for_address(addr)
+
+        if fallback_symbol:
+            sanitized_symbol = (
+                fallback_symbol[0],
+                exporter.sanitize_label_name(fallback_symbol[1]),
+            )
+        else:
+            sanitized_symbol = None
+
+        if sanitized_symbol:
+            ref = self.normalize_ref(sanitized_symbol[1],
+                                     sanitized_symbol[0])
+        elif ADDR_RE.match(norm_addr):
+            if norm_addr.startswith('00'):
+                ref = '#$%s' % norm_addr[2:]
+            else:
+                ref = '#$%s' % norm_addr
+        else:
+            ref = addr_str
+
+        return ref
+
+    def normalize_ref(
+        self,
+        ref,              # type: str
+        block_name=None,  # type: str | None
+    ):  # type: (...) -> str
+        if ref.startswith('{{@SYMBOL:'):
+            return ref
+
+        suffix = ''
+
+        if ref.endswith('_1'):
+            ref = ref[:-2]
+            suffix = '+1'
+
+        if block_name is None:
+            symbol = self.exporter.find_symbol_for_address(ref)
+
+            if symbol is not None:
+                block_name = symbol[0]
+
+        if block_name is not None:
+            ref = (
+                '{{@SYMBOL:%s::%s@}}'
+                % (block_name, ref)
+            )
+
+        return '%s%s' % (ref, suffix)
+
+    def export_data_tree(
+        self,
+        data,             # type: Data
+        writer,           # type: FileWriter
+        index_path=None,  # type: list[int] | None
+    ):  # type: (...) -> int
+        if index_path is None:
+            index_path = []
+
+        data_type = data.getDataType()
+        data_len = data.getLength()
+        block_initialized = self.is_block_initialized
+
+        is_array = isinstance(data_type, Array)
+
+        if is_array or isinstance(data_type, (Structure, Union)):
+            count = data.getNumComponents()
+
+            for i in range(count):
+                child = data.getComponent(i)
+
+                if is_array:
+                    new_index_path = index_path + [i]
+                else:
+                    new_index_path = index_path
+
+                self.export_data_tree(data=child,
+                                      writer=writer,
+                                      index_path=new_index_path)
+        else:
+            byte_addr = data.getAddress()
+            data_type_str = get_data_type_str(data_type)
+
+            if block_initialized:
+                data_bytes = data.getBytes()
+            else:
+                data_bytes = [None] * data_len
+
+            if data_type_str in {'pointer', 'short', 'ushort'}:
+                # We'll need to specially output these as shorts.
+                assert data_len % 2 == 0
+
+                data_size = 2
+
+                if block_initialized:
+                    data_values = [
+                        (data_bytes[i] & 0xFF) |
+                        ((data_bytes[i + 1] & 0xFF) << 8)
+                        for i in range(0, data_len, 2)
+                    ]
+                else:
+                    data_values = [None] * (data_len // 2)
+            else:
+                # Output anything else as bytes.
+                data_values = data_bytes
+                data_size = 1
+
+            self._encode_bytes(
+                data_values=data_values,
+                data_type=data_type,
+                data_type_str=data_type_str,
+                size=data_size,
+                writer=writer,
+                addr=byte_addr,
+                index_path=index_path)
+
+        return data_len
+
+    def _encode_bytes(
+        self,
+        data_values,    # type: list[int]
+        data_type,      # type: DataType
+        data_type_str,  # type: str
+        size,           # type: int
+        writer,         # type: FileWriter
+        addr,           # type: Address
+        index_path,     # type: list[int]
+    ):  # type: (...) -> None
+        assert data_values
+
+        exporter = self.exporter
+        listing = exporter.listing
+        bytes_writer = self.bytes_writer
+        end_addr = self.end_addr
+        check_jump_tables = data_type_str in {'pointer', 'ushort'}
+
+        if index_path and data_type_str != 'char':
+            comment_prefix = ''.join(
+                '[%s]: ' % i
+                for i in index_path
+            )
+            default_comment_suffix = ''
+        else:
+            comment_prefix = ''
+            default_comment_suffix = data_type_str
+
+        for value in data_values:
+            labeled = self.export_labels_and_comments(addr, writer)
+            comment_suffix = listing.getComment(CodeUnit.EOL_COMMENT, addr)
+
+            if comment_prefix or comment_suffix:
+                eol_comment = '%s%s' % (
+                    comment_prefix,
+                    comment_suffix or default_comment_suffix,
+                )
+            else:
+                eol_comment = None
+
+            output_bytes = True
+
+            # Specially handle references to functions for jump tables.
+            if check_jump_tables:
+                jump_dest_func = self._find_func_ref_from(addr)
+
+                if jump_dest_func is not None:
+                    bytes_writer.flush()
+                    jump_dest_func_addr = \
+                        jump_dest_func.getEntryPoint()
+                    jump_dest_func_addr_value = \
+                        jump_dest_func_addr.getUnsignedOffset()
+
+                    dest_name = jump_dest_func.getName()
+
+                    if jump_dest_func_addr_value - 1 == value:
+                        dest_name = '%s-1' % self.normalize_ref(
+                            dest_name,
+                            exporter.get_block_name_for_addr(
+                                jump_dest_func_addr))
+
+                    writer.write_code(
+                        ['dw', dest_name],
+                        eol_comment=self.process_comment(eol_comment))
+
+                    output_bytes = False
+
+            if output_bytes:
+                bytes_writer.append(
+                    value,
+                    addr,
+                    data_type=data_type,
+                    size=size,
+                    eol_comment=self.process_comment(eol_comment),
+                    labeled=labeled)
+
+            if addr == end_addr:
+                break
+
+            try:
+                addr = addr.addNoWrap(size)
+            except Exception:
+                break
+
+    def _find_func_ref_from(
+        self,
+        addr,  # type: Address
+    ):  # type: (...) -> Function | None
+        exporter = self.exporter
+        func_manager = exporter.func_manager
+        ref_manager = exporter.ref_manager
+
+        for ref in ref_manager.getReferencesFrom(addr):
+            to_addr = ref.getToAddress()
+
+            if to_addr is None:
+                continue
+
+            func = func_manager.getFunctionAt(to_addr)
+
+            if func:
+                return func
+
+        return None
+
+    def _get_default_func_comment(
+        self,
+        func,  # type: Function
+    ):  # type: (...) -> str
+        params = func.getParameters()
+        func_return = func.getReturn()
+
+        comment = [
+            'TODO: Document %s' % func.getName(),
+            '',
+            'INPUTS:',
+        ]
+
+        if params:
+            for param in params:
+                comment.append('    %s' % param.getRegister().getName())
+        else:
+            comment.append('    None.')
+
+        comment += [
+            '',
+            'OUTPUTS:',
+        ]
+
+        if func_return:
+            register = func_return.getRegister()
+
+            if register:
+                return_name = register.getName()
+            else:
+                return_name = func_return.getName()
+
+            if return_name == '<RETURN>':
+                return_name = 'TODO'
+
+            comment.append('    %s' % return_name)
+        else:
+            comment.append('    None.')
+
+        return '\n'.join(comment)
+
+    def _add_xrefs_to_comment(
+        self,
+        comment,  # type: str
+        addr,     # type: Address
+    ):  # type: (...) -> str
+        xrefs = set()  # type: set[str]
+        exporter = self.exporter
+        listing = exporter.listing
+        symbol_table = exporter.symbol_table
+        refs_to_addr = self.exporter.ref_manager.getReferencesTo(addr)
+
+        if refs_to_addr:
+            for ref in refs_to_addr:
+                if not ref.isMemoryReference():
+                    continue
+
+                ref_type = ref.getReferenceType()
+
+                if ref_type == RefType.FALL_THROUGH:
+                    continue
+
+                from_addr = ref.getFromAddress()
+
+                # Check if there's a function managing the reference.
+                func = exporter.func_manager.getFunctionContaining(from_addr)
+
+                if func is not None:
+                    xrefs.add(self.normalize_ref(
+                        func.getName(),
+                        exporter.get_block_name_for_addr(from_addr)))
+                    continue
+
+                # Check if there's a data section managing the reference.
+                data = listing.getDataContaining(from_addr)
+
+                if data is not None:
+                    # Walk to the top of the data.
+                    parent = data.getParent()
+
+                    while (parent is not None and
+                           parent.getAddress() is not None and
+                           parent.getAddress().compareTo(
+                               data.getAddres()) <= 0 and
+                           parent.getMaxAddress().compareTo(from_addr) >= 0):
+                        data = parent
+                        parent = data.getParent()
+
+                    symbol = symbol_table.getPrimarySymbol(data.getAddress())
+
+                    if symbol is not None:
+                        xrefs.add(
+                            '%s [$%s]'
+                            % (self.normalize_ref(
+                                symbol.getName(True),
+                                exporter.get_block_name_for_addr(from_addr)),
+                               from_addr.toString())
+                        )
+
+                    continue
+
+                # Get the nearest label.
+                symbol = symbol_table.getPrimarySymbol(from_addr)
+
+                if symbol is not None:
+                    xrefs.add(
+                        '%s [$%s]'
+                        % (self.normalize_ref(
+                            symbol.getName(True),
+                            exporter.get_block_name_for_addr(from_addr)),
+                           from_addr.toString())
+                    )
+
+                    continue
+
+            if xrefs:
+                comment = '%s\n\nXREFS:\n%s' % (
+                    comment,
+                    '\n'.join(
+                        '    %s' % ref_name
+                        for ref_name in sorted(xrefs)
+                    )
+                )
+
+        return comment
+
+
+class Exporter:
+    def __init__(
+        self,
+        program,  # type: Program
+    ):  # type: (...) -> None
+        self.program = program
+        self.listing = program.getListing()
+        self.memory = program.getMemory()
+        self.blocks = self.memory.getBlocks()
+        self.func_manager = program.getFunctionManager()
+        self.ref_manager = program.getReferenceManager()
+        self.equate_table = program.getEquateTable()
+        self.symbol_table = program.getSymbolTable()
+        self.addr_factory = program.getAddressFactory()
+        self.default_addr_space = self.addr_factory.getDefaultAddressSpace()
+
+        program_name = program.getName()
+
+        if program_name.endswith(' - .ProgramDB'):
+            program_name = program_name[:len(' - .ProgramDB')]
+
+        self.program_name = program_name
+
+        self.addr_to_label = {}   # type: dict[str, list[tuple[str, str]]]
+        self.addr_to_symbol = {}  # type: dict[str, list[tuple[str, str]]]
+        self.labels_cache = {}    # type: dict[str, list[tuple[str, str]]]
+        self.name_to_symbol = {}  # type: dict[str, list[Symbol]]
+
+    def export(self):
+        self.build_symbol_maps()
+
+        filename_basepath = '/Users/chipx86/src/faxanadu'
+
+        self.export_defs(filename_basepath)
+
+        for block in self.blocks:
+            self.export_block(block, filename_basepath)
+
+    def export_defs(
+        self,
+        base_path,  # type: str
+    ):  # type: (...) -> None
+        writer = MultiFileWriter(base_path=base_path,
+                                 block_name='DEFS',
+                                 program_name=self.program_name)
+
+        data_types = self.program.getDataTypeManager().getAllDataTypes()
+
+        with writer.open():
+            while data_types.hasNext():
+                data_type = data_types.next()
+
+                if isinstance(data_type, Enum):
+                    writer.write_comment(data_type.getName(),
+                                         use_plate_syntax=True)
+
+                    writer.write_equs([
+                        (data_type.getName(value),
+                         '${:02x}'.format(value))
+                        for value in data_type.getValues()
+                    ])
+
+    def export_block(
+        self,
+        block,      # type: Block
+        base_path,  # type: str
+    ):  # type: (...) -> None
+        if block.getSize() <= 0:
+            return
+
+        block_exporter = BlockExporter(block=block,
+                                       exporter=self)
+        writer = MultiFileWriter(base_path=base_path,
+                                 block_name=block_exporter.block_name,
+                                 program_name=self.program_name)
+
+        with writer.open():
+            block_exporter.export(writer)
+
+    def build_symbol_maps(self):  # type: (...) -> None
+        addr_to_label_map = {}   # type: dict[str, list[tuple[str, str]]]
+        addr_to_symbol_map = {}  # type: dict[str, list[tuple[str, str]]]
+        name_to_symbol_map = {}  # type: dict[str, list[Symbol]]
+
+        symbols = self.symbol_table.getSymbolIterator()
+
+        while symbols.hasNext():
+            symbol = symbols.next()
+            addr = symbol.getAddress()
+
+            if not addr:
+                continue
+
+            symbol_name = symbol.getName()
+            is_user_symbol = (symbol.getSource() != 0)
+
+            is_label = False
+            is_user_label = False
+
+            if symbol.getSymbolType() == SymbolType.LABEL:
+                is_label = True
+                is_user_label = (is_label and is_user_symbol)
+
+            addr_str = addr.toString()
+            addr_key = addr_str.lower()
+
+            name_to_symbol_map.setdefault(symbol_name, []).append(symbol)
+
+            addr_to_symbol_map.setdefault(addr_key, []).append((
+                self.get_block_name_for_addr(addr),
+                self.sanitize_label_name(symbol_name)
+            ))
+
+            if is_user_label or addr_str not in addr_to_label_map:
+                label_name = self.sanitize_label_name(symbol_name)
+
+                if label_name:
+                    addr_to_label_map.setdefault(addr_key, []).append((
+                        self.get_block_name_for_addr(addr),
+                        label_name,
+                    ))
+
+        self.addr_to_label = addr_to_label_map
+        self.addr_to_symbol = addr_to_symbol_map
+        self.name_to_symbol = name_to_symbol_map
+
+    def normalize_address(self, addr, block_name=''):
+        if not addr or not isinstance(addr, Address):
+            return None
+
+        return self.normalize_address_from_string(
+            addr.toString().rsplit(':', 1)[-1],
+            block_name)
+
+    def normalize_address_from_string(self, addr_str, block_name=''):
+        if addr_str.startswith('0x'):
+            addr_str = addr_str[2:]
+
+        try:
+            int_val = int(addr_str, 16)
+
+            return '{:04x}'.format(int_val)
+        except ValueError:
+            return addr_str.lower().zfill(4)
+
+    def get_block_name_for_addr(
+        self,
+        addr,  # typing: Address | str
+    ):  # type: (...) -> str
+        if isinstance(addr, Address):
+            addr = addr.getAddressSpace().toString()
+
+        parts = addr.split(':', 1)
+
+        if len(parts) == 2:
+            return parts[0]
+
+        symbol = self.name_to_symbol.get(addr)
+
+        if symbol:
+            return (
+                symbol[0].getAddress().getAddressSpace().toString()
+                .split('::', 1)[0]
+            )
+
+        print(repr(addr))
+        assert addr != 'PPUADDR'
+
+        return 'XXX'
+
+    def find_symbol_for_address(
+        self,
+        addr,  # type: Address | str
+    ):  # type: (...) -> tuple[str, str] | None
+        symbols = self.find_symbols_for_address(addr)
+
+        if symbols:
+            return symbols[0]
+
+        return None
+
+    def find_symbols_for_address(
+        self,
+        addr,  # type: Address | str
+    ):  # type: (...) -> list[tuple[str, str]]
+        if isinstance(addr, (str, unicode)):
+            if SYMBOL_RE.match(addr):
+                addr = self.default_addr_space.getAddress(addr)
+            else:
+                return []
+                assert False, addr
+                return addr
+
+        result = []  # type: list[tuple[str, str]]
+
+        if addr is None:
+            return result
+
+        assert isinstance(addr, Address), addr
+
+        symbols = self.symbol_table.getSymbols(addr)
+
+        remaining_result = []
+
+        addr_str = addr.toString().lower()
+        result += self.addr_to_label.get(addr_str, [])
+        result += self.addr_to_symbol.get(addr_str, [])
+
+        if 1:
+            for symbol in symbols:
+                #assert symbol.getName() != 'PPUADDR', (
+                #    symbol.getAddress().getAddressSpace().getName(),
+                #)
+
+                symbol_info = (
+                    self.get_block_name_for_addr(symbol.getAddress()),
+                    self.sanitize_label_name(symbol.getName()),
+                )
+
+                if (symbol.getSource() != 0 and
+                    symbol.getSymbolType() == SymbolType.LABEL):
+                    result.append(symbol_info)
+                else:
+                    remaining_result.append(symbol_info)
+
+        result += remaining_result
+
+        return result
+
+    def sanitize_label_name(self, name):
+        assert name
+
+        label_name = INVALID_LABEL_NAME_RE.sub('_', name)
+
+        if (label_name.startswith(('_', 'LAB_')) and
+            not label_name.startswith('_thunk_')):
+            label_name = '@%s' % label_name
+
+        return label_name
+
+    def get_labels_at_addr(
+        self,
+        addr,  # type: Program
+    ):  # type: (...) -> list[str]
+        labels_cache = self.labels_cache
+        addr_str = addr.toString().lower()
+
+        try:
+            return labels_cache[addr_str]
+        except KeyError:
+            pass
+
+        symbols = self.symbol_table.getSymbols(addr)
+        instruction = self.listing.getInstructionAt(addr)
+        new_labels = set()
+
+        for symbol in symbols:
+            symbol_name = symbol.getName()
+            symbol_type = symbol.getSymbolType()
+            is_user_symbol = (symbol.getSource() != 0)
+            include_colon = False
+
+            if symbol_type == SymbolType.FUNCTION:
+                include_colon = True
+            elif is_user_symbol and symbol_type == SymbolType.LABEL:
+                include_colon = (instruction is not None and
+                                 instruction.getAddress().equals(addr))
+
+            if include_colon and symbol_name not in labels_cache:
+                new_labels.add(self.sanitize_label_name(symbol_name))
+
+        new_labels.update(
+            symbol[1]
+            for symbol in self.find_symbols_for_address(addr)
+        )
+
+        result = sorted(new_labels)
+        labels_cache[addr_str] = result
+
+        return result
+
+if __name__ == '__main__':
+    print('=' * 60)
+    print(' Exporting 6502')
+    print('=' * 60)
+
+    exporter = Exporter(state.getCurrentProgram())
+    exporter.export()
