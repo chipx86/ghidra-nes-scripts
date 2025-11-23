@@ -471,17 +471,19 @@ class FileWriter(object):
     def write_anchor(
         self,
         name,  # type: str
+        addr,  # type: Address
     ):  # type: (...) -> None
         pass
 
     def write_label(
         self,
         label_name,        # type: str
+        addr,              # type: Address
         is_local=False,    # type: bool
         eol_comment=None,  # type: str | None
     ):  # type: (...) -> None
         self.write_line_with_eol_comment(
-            self.format_label(label_name,
+            self.format_label(label_name, addr,
                               is_local=is_local),
             eol_comment=eol_comment,
         )
@@ -593,6 +595,7 @@ class FileWriter(object):
     def format_label(
         self,
         label_name,  # type: str
+        addr,        # type: Address
         is_local,    # type: bool
     ):  # type: (...) -> str
         raise NotImplementedError
@@ -673,6 +676,7 @@ class TextFileWriter(FileWriter):
     def format_label(
         self,
         label_name,  # type: str
+        addr,        # type: Address
         is_local,    # type: bool
     ):  # type: (...) -> str
         if is_local:
@@ -849,11 +853,14 @@ class HTMLFileWriter(FileWriter):
     def write_anchor(
         self,
         name,  # type: str
+        addr,  # type: Address
     ):  # type: (...) -> None
         fp = self.fp
         assert fp is not None
 
-        fp.write('<a name="%s"></a>' % self._escape(name))
+        anchor = self._normalize_anchor(name, addr)
+
+        fp.write('<a name="%s"></a>' % self._escape(anchor))
 
     def write_line_with_eol_comment(
         self,
@@ -950,6 +957,7 @@ class HTMLFileWriter(FileWriter):
     def format_label(
         self,
         label_name,  # type: str
+        addr,        # type: Address
         is_local,    # type: bool
     ):  # type: (...) -> str
         if is_local:
@@ -958,8 +966,9 @@ class HTMLFileWriter(FileWriter):
             cssclass = 'la'
 
         return HTMLString(
-            '<a name="{label}" href="#{label}" class="{cssclass}">{label}:</a>'
-            .format(cssclass=cssclass,
+            '<a href="#{anchor}" class="{cssclass}">{label}:</a>'
+            .format(anchor=self._normalize_anchor(label_name, addr),
+                    cssclass=cssclass,
                     label=self._escape(label_name))
         )
 
@@ -1002,6 +1011,16 @@ class HTMLFileWriter(FileWriter):
             .replace('>', '&gt;')
         )
 
+    def _normalize_anchor(
+        self,
+        name,  # type: str
+        addr,  # type: Address
+    ):  # type: (...) -> str
+        if name.startswith('@'):
+            name = '%s:%s' % (name, addr.toString().split(':', 1)[-1])
+
+        return name
+
 
 class MultiFileWriter(FileWriter):
     def __init__(
@@ -1027,6 +1046,14 @@ class MultiFileWriter(FileWriter):
     ):  # type: (...) -> None
         self.asm_writer.new_code_unit(*args, **kwargs)
         self.html_writer.new_code_unit(*args, **kwargs)
+
+    def write_anchor(
+        self,
+        *args,
+        **kwargs
+    ):  # type: (...) -> None
+        self.asm_writer.write_anchor(*args, **kwargs)
+        self.html_writer.write_anchor(*args, **kwargs)
 
     def write_line(
         self,
@@ -1259,34 +1286,49 @@ class BlockExporter:
         else:
             pre_comment_indent = ''
 
+        if plate_comment or (func is None and pre_comment):
+            writer.write_blank_line(count=2)
+        elif pending_labels and not plate_comment and not pre_comment:
+            writer.write_blank_line()
+
         if func is not None:
+            # This is a function. Write the anchor and prepare a plate
+            # comment if needed.
             writer.new_code_unit()
-            writer.write_anchor(addr)
+            writer.write_anchor(func.getName(), addr)
 
             if not plate_comment:
                 plate_comment = self._get_default_func_comment(func)
+        elif pending_labels:
+            # This is not a function, but it has a label. Write an anchor.
+            for label in pending_labels:
+                label_name = exporter.sanitize_label_name(label)
 
+                if label_name:
+                    writer.write_anchor(label_name, addr)
+
+            # Normalize the first pre-comment, if not a local label.
+            if not pending_labels[0].startswith('@'):
+                pre_comment = self._add_xrefs_to_comment(pre_comment or '',
+                                                         addr)
+
+        # If there's a plate comment, write it here.
+        if plate_comment:
             plate_comment = self._add_xrefs_to_comment(plate_comment, addr)
 
         self.export_comment(plate_comment,
                             writer=writer,
-                            leading_blank=2,
+                            leading_blank=0,
                             use_plate_syntax=True)
 
         if func is None:
-            # Write this comment at this location, before any labels.
-            if pending_labels and not pending_labels[0].startswith('@'):
-                pre_comment = self._add_xrefs_to_comment(pre_comment or '',
-                                                         addr)
-
+            # Write a pre-comment at this location, before any labels.
             self.export_comment(pre_comment,
                                 writer=writer,
                                 indent=pre_comment_indent)
 
+        # Write any labels.
         if pending_labels:
-            if not plate_comment and not pre_comment:
-                writer.write_blank_line()
-
             eol_comment = '[$%s]' % addr.toString().split(':')[-1]
 
             for label in pending_labels:
@@ -1295,6 +1337,7 @@ class BlockExporter:
                 if label_name:
                     writer.write_label(
                         label_name,
+                        addr=addr,
                         is_local=label_name.startswith('@'),
                         eol_comment=eol_comment,
                     )
