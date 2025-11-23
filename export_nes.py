@@ -228,7 +228,6 @@ class BytesWriter:
         data_type_str = data_type.getName()
         assert data_type_str
 
-
         if data_type_str == 'char':
             # This is a char. Output as strings.
             groups = self._group_string(buffer)
@@ -285,6 +284,7 @@ class BytesWriter:
             )
 
         self.writer.write_code(data_text,
+                               addr=start_addr,
                                eol_comment=eol_comment)
         self.buffer = []
         self.start_addr = None
@@ -410,17 +410,20 @@ class FileWriter(object):
 
     def write_line(
         self,
-        line,  # type: str
+        line,       # type: str
+        addr=None,  # type: Address | None
     ):  # type: (...) -> None
         fp = self.fp
         assert fp is not None
 
         self.blank_line_count = 0
-        fp.write(self.format_line(self.process_line(line)))
+        fp.write(self.format_line(self.process_line(line),
+                                  addr=addr))
 
     def write_lines(
         self,
-        lines,  # type: list[str]
+        lines,      # type: list[str]
+        addr=None,  # type: Address
     ):  # type: (...) -> None
         fp = self.fp
         assert fp is not None
@@ -434,21 +437,26 @@ class FileWriter(object):
     def write_line_with_eol_comment(
         self,
         line,         # type: str
+        addr,         # type: Address
         eol_comment,  # type: str | None
     ):  # type: (...) -> None
         if eol_comment:
             padding = ' ' * max(1, COMMENT_COLUMN - len(line) - 1)
             line_prefix = '%s%s' % (line, padding)
 
-            self.write_lines(textwrap.wrap(
-                eol_comment,
-                break_long_words=False,
-                break_on_hyphens=False,
-                initial_indent='%s; ' % line_prefix,
-                subsequent_indent='%s; ' % (' ' * len(line_prefix)),
-                width=MAX_COMMENT_LINE_LEN))
+            self.write_lines(
+                textwrap.wrap(
+                    eol_comment,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                    initial_indent='%s; ' % line_prefix,
+                    subsequent_indent='%s; ' % (' ' * len(line_prefix)),
+                    width=MAX_COMMENT_LINE_LEN,
+                ),
+                addr=addr)
         else:
-            self.write_line(line)
+            self.write_line(line,
+                            addr=addr)
 
     def write_blank_line(
         self,
@@ -464,7 +472,7 @@ class FileWriter(object):
             # line processing per-line, rather than treating as an atomic
             # set of lines.
             for i in range(new_blank_line_count):
-                self.write_line('')
+                self.write_line('', addr=None)
 
             self.blank_line_count = new_blank_line_count
 
@@ -485,29 +493,33 @@ class FileWriter(object):
         self.write_line_with_eol_comment(
             self.format_label(label_name, addr,
                               is_local=is_local),
+            addr=addr,
             eol_comment=eol_comment,
         )
 
     def write_code(
         self,
         code,                    # type: list[str]
+        addr,                    # type: Address
         instruction_bytes=None,  # type: list[str] | None
         eol_comment=None,        # type: str | None
     ):  # type: (...) -> None
         self.write_line_with_eol_comment(
             self.process_line(self.format_code(code)),
+            addr=addr,
             eol_comment=eol_comment,
         )
 
     def write_equs(
         self,
-        equs,  # type: list[tuple[str, str]]
+        equs,       # type: list[tuple[str, str]]
     ):  # type: (...) -> None
         self.write_lines(self.format_equs(equs))
 
     def write_comment(
         self,
         comment,                 # type: str
+        addr=None,               # type: Address
         indent='',               # type: str
         leading_blank=1,         # type: int
         use_plate_syntax=False,  # type: bool
@@ -563,20 +575,24 @@ class FileWriter(object):
         norm_lines.append(';%s' % bullet_extra)
 
         self.write_comment_lines(norm_lines,
+                                 addr=addr,
                                  indent=indent,
                                  use_plate_syntax=use_plate_syntax)
 
     def write_comment_lines(
         self,
         lines,             # type: list[str]
+        addr,              # type: Address
         indent,            # type: str
         use_plate_syntax,  # type: bool
     ):  # type: (...) -> None
-        self.write_lines(lines)
+        self.write_lines(lines,
+                         addr=addr)
 
     def format_line(
         self,
         line,  # type: str
+        addr,  # type: Address | None
     ):  # type: (...) -> str
         return '%s\n' % line
 
@@ -620,35 +636,43 @@ class TextFileWriter(FileWriter):
     def write_line_with_eol_comment(
         self,
         line,         # type: str
+        addr,         # type: Address
         eol_comment,  # type: str | None
     ):  # type: (...) -> None
         if eol_comment:
             padding = ' ' * max(1, COMMENT_COLUMN - len(line) - 1)
             line_prefix = '%s%s' % (line, padding)
 
-            self.write_lines(textwrap.wrap(
-                eol_comment,
-                break_long_words=False,
-                break_on_hyphens=False,
-                initial_indent='%s; ' % line_prefix,
-                subsequent_indent='%s; ' % (' ' * len(line_prefix)),
-                width=MAX_COMMENT_LINE_LEN))
+            self.write_lines(
+                textwrap.wrap(
+                    eol_comment,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                    initial_indent='%s; ' % line_prefix,
+                    subsequent_indent='%s; ' % (' ' * len(line_prefix)),
+                    width=MAX_COMMENT_LINE_LEN,
+                ),
+                addr=addr)
         else:
-            self.write_line(line)
+            self.write_line(line,
+                            addr=addr)
 
     def write_comment_lines(
         self,
         lines,             # type: list[str]
+        addr,              # type: Address
         indent,            # type: str
         use_plate_syntax,  # type: bool
     ):  # type: (...) -> None
         fp = self.fp
         assert fp is not None
 
-        self.write_lines([
-            '%s%s' % (indent, line)
-            for line in lines
-        ])
+        self.write_lines(
+            [
+                '%s%s' % (indent, line)
+                for line in lines
+            ],
+            addr=addr)
 
     def format_code(
         self,
@@ -717,6 +741,7 @@ class HTMLFileWriter(FileWriter):
           background: #1c212d;
           color: white;
           padding: 0.5em;
+          line-height: 1.5;
         }
 
         body, * {
@@ -732,10 +757,28 @@ class HTMLFileWriter(FileWriter):
 
         pre {
           display: grid;
-          grid-template-columns: minmax(70ch, max-content) 1fr;
-          gap: 0 4em;
+          grid-template-columns: minmax(6ch, min-content)
+                                 minmax(70ch, max-content)
+                                 1fr;
+          gap: 0 3em;
           margin: 0;
           padding: 0;
+        }
+
+        .anc {
+          grid-area: addr;
+          grid-column: 1;
+          grid-row: 1;
+        }
+
+        .anc:link,
+        .anc:visited {
+          color: #666677;
+          text-decoration: none;
+        }
+
+        .anc:link:hover {
+          color: #9bdeff;
         }
 
         .equs {
@@ -747,14 +790,14 @@ class HTMLFileWriter(FileWriter):
         .l {
           display: grid;
           grid-template-columns: subgrid;
+          grid-column: 1 / -1;
           min-height: 1lh;
         }
 
         .c,
         .cp,
-        .equs,
-        .l {
-          grid-column: 1 / -1;
+        .equs {
+          grid-column: 2;
         }
 
         .cp {
@@ -769,7 +812,12 @@ class HTMLFileWriter(FileWriter):
           color: #8aa9ac;
         }
 
+        .cd {
+          grid-column: 2 / 3;
+        }
+
         .ce {
+          grid-column: -1;
           text-wrap: wrap;
           text-indent: 2ch hanging;
         }
@@ -781,6 +829,7 @@ class HTMLFileWriter(FileWriter):
         .la,
         .lla {
           font-weight: bold;
+          grid-column: 2 / 3;
         }
 
         .la,
@@ -865,20 +914,25 @@ class HTMLFileWriter(FileWriter):
     def write_line_with_eol_comment(
         self,
         line,         # type: str
+        addr,         # type: Address
         eol_comment,  # type: str | None
     ):  # type: (...) -> None
         if eol_comment:
-            self.write_line(HTMLString(
-                '{line}<span class="ce">; {comment}</span>'
-                .format(line=self._escape(line),
-                        comment=self._escape(eol_comment))
-            ))
+            self.write_line(
+                HTMLString(
+                    '{line}<span class="ce">; {comment}</span>'
+                    .format(line=self._escape(line),
+                            comment=self._escape(eol_comment))
+                ),
+                addr=addr)
         else:
-            self.write_line(line)
+            self.write_line(line,
+                            addr=addr)
 
     def write_comment_lines(
         self,
-        lines,  # type: list[str]
+        lines,             # type: list[str]
+        addr,              # type: Address
         indent,            # type: str
         use_plate_syntax,  # type: bool
     ):  # type: (...) -> None
@@ -891,15 +945,17 @@ class HTMLFileWriter(FileWriter):
             css_class = 'c'
 
         fp.write('<div class="%s">' % css_class)
-        self.write_lines([
-            self._escape(line)
-            for line in lines
-        ])
+        self.write_lines(
+            [
+                self._escape(line)
+                for line in lines
+            ],
+            addr=addr)
         fp.write('</div>')
 
     def write_equs(
         self,
-        equs,  # type: list[tuple[str, str]]
+        equs,       # type: list[tuple[str, str]]
     ):  # type: (...) -> None
         fp = self.fp
         assert fp is not None
@@ -911,10 +967,20 @@ class HTMLFileWriter(FileWriter):
     def format_line(
         self,
         line,  # type: str
+        addr,  # type: Address | None
     ):  # type: (...) -> str
+        if addr is None:
+            anchor = ''
+        else:
+            anchor = (
+                '<a class="anc" name="{addr}" href="#{addr}">[{addr}]</a>'
+                .format(addr=addr.toString().split(':')[-1])
+            )
+
         return HTMLString(
-            '<span class="l">{line}</span>\n'
-            .format(line=self._escape(line))
+            '<span class="l">{anchor}{line}</span>\n'
+            .format(anchor=anchor,
+                    line=self._escape(line))
         )
 
     def format_code(
@@ -935,7 +1001,7 @@ class HTMLFileWriter(FileWriter):
                 )
             )
 
-        return HTMLString('<span>%s</span>' % result)
+        return HTMLString('<span class="cd">%s</span>' % result)
 
     def format_equs(
         self,
@@ -1017,7 +1083,7 @@ class HTMLFileWriter(FileWriter):
         addr,  # type: Address
     ):  # type: (...) -> str
         if name.startswith('@'):
-            name = '%s:%s' % (name, addr.toString().split(':', 1)[-1])
+            name = '%s:%s' % (addr.toString().split(':', 1)[-1], name)
 
         return name
 
@@ -1160,11 +1226,13 @@ class BlockExporter:
                         start_addr=norm_start_addr,
                         end_addr=norm_end_addr)
             ),
+            addr=start_addr,
             leading_blank=0,
             use_plate_syntax=True,
         )
         writer.write_blank_line()
-        writer.write_line('BASE $%s' % norm_start_addr)
+        writer.write_code(['BASE $%s' % norm_start_addr],
+                          addr=None)
         writer.write_blank_line()
 
         cur_addr = start_addr
@@ -1242,6 +1310,7 @@ class BlockExporter:
         writer.write_code(
             code=code,
             instruction_bytes=instruction_bytes,
+            addr=addr,
             eol_comment=self.process_comment(
                 listing.getComment(CodeUnit.EOL_COMMENT, addr)),
         )
@@ -1755,6 +1824,7 @@ class BlockExporter:
 
                     writer.write_code(
                         ['dw', dest_name],
+                        addr=addr,
                         eol_comment=self.process_comment(eol_comment))
 
                     output_bytes = False
