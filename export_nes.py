@@ -37,14 +37,15 @@ from ghidra.program.model.symbol import SymbolType, Symbol, RefType
 
 if 0:
     import typing
+    from typing import Any
 
 
 
-INVALID_LABEL_NAME_RE = re.compile(r'[^A-Za-z0-9_@.]')
+INVALID_LABEL_NAME_RE = re.compile(r'[^A-Za-z0-9_@]')
 
 INDIRECT_MATCH = re.compile(
     r'(?P<prefix>\()'
-    r'\$?(?P<addr>0x[A-Fa-f0-9]+)'
+    r'?\$?(?P<addr>0x[A-Fa-f0-9]+)'
     r'(?P<suffix>\),Y|,X\))$',
     re.IGNORECASE)
 
@@ -1337,7 +1338,7 @@ class BlockExporter:
         addr,           # type: Address
         writer,         # type: FileWriter
         is_inner=False  # type: bool
-    ):  # type: (...) -> bool
+    ):  # type: (...) -> dict[str, Any] | None
         exporter = self.exporter
         listing = exporter.listing
 
@@ -1420,7 +1421,14 @@ class BlockExporter:
                                 indent=pre_comment_indent,
                                 leading_blank=0)
 
-        return bool(plate_comment or pre_comment or pending_labels)
+        if not plate_comment and not pre_comment and not pending_labels:
+            return None
+
+        return {
+            'labels': pending_labels,
+            'plate_comment': plate_comment,
+            'pre_comment': pre_comment,
+        }
 
     def export_comment(
         self,
@@ -1593,53 +1601,98 @@ class BlockExporter:
             ),
             comment.rstrip())
 
+    def get_ref_str_from_addr(
+        self,
+        addr,  # type: Address
+    ):  # type: (...) -> str | None
+        exporter = self.exporter
+        symbol = None
+        refs = exporter.ref_manager.getReferencesFrom(addr)
+
+        if refs:
+            assert len(refs) == 1
+
+            symbol = exporter.symbol_table.getPrimarySymbol(
+                refs[0].getToAddress())
+
+            if symbol:
+                return self.normalize_ref(
+                    symbol.getName(True),
+                    exporter.get_block_name_for_addr(addr))
+
+        return None
+
     def get_ref_to_addr(
         self,
         addr_str,  # type: str
     ):  # type: (...) -> str
         addr = None             # type: Address | None
         fallback_symbol = None  # type: tuple | None
+        sanitized_symbol = None
+        sanitized_symbol_offset = 0
 
-        m = SYMBOL_RE.match(addr_str)
+        norm_addr_str = addr_str.lower()
+        norm_addrs = [(norm_addr_str, 0)]
 
-        if m:
-            block_name = m.group('block')
-        else:
-            block_name = None
+        if '::' not in norm_addr_str:
+            norm_addrs.append((
+                '%s::%s' % (self.block_name.lower(), norm_addr_str),
+                0,
+            ))
 
-        norm_addr = addr_str.lower()
-        #norm_addr = exporter.normalize_address_from_string(addr_str)
+        for norm_addr, offset in list(norm_addrs):
+            parts = norm_addr.split(':')
 
-        if norm_addr:
-            fallback_symbol = (
-                exporter.addr_to_label.get(norm_addr, [None])[0] or
-                exporter.addr_to_symbol.get(norm_addr, [None])[0]
-            )
+            try:
+                temp_addr = int(parts[-1], 16) - 1
+            except ValueError:
+                continue
 
-            if not fallback_symbol and SYMBOL_RE.match(norm_addr) and addr:
-                addr = exporter.default_addr_space.getAddress(norm_addr)
+            norm_addrs.append((
+                '%s%04x' % ('::'.join(parts[:-1]), temp_addr),
+                1,
+            ))
 
-                if addr:
-                    fallback_symbol = exporter.find_symbol_for_address(addr)
+        for norm_addr, offset in norm_addrs:
+            if norm_addr:
+                fallback_symbol = (
+                    exporter.addr_to_label.get(norm_addr, [None])[0] or
+                    exporter.addr_to_symbol.get(norm_addr, [None])[0]
+                )
 
-        if fallback_symbol:
-            sanitized_symbol = (
-                fallback_symbol[0],
-                exporter.sanitize_label_name(fallback_symbol[1]),
-            )
-        else:
-            sanitized_symbol = None
+                if not fallback_symbol and SYMBOL_RE.match(norm_addr) and addr:
+                    addr = exporter.default_addr_space.getAddress(norm_addr)
+
+                    if addr:
+                        fallback_symbol = \
+                            exporter.find_symbol_for_address(addr)
+
+                if fallback_symbol:
+                    sanitized_symbol = (
+                        fallback_symbol[0],
+                        exporter.sanitize_label_name(fallback_symbol[1]),
+                    )
+                else:
+                    sanitized_symbol = None
+
+                if sanitized_symbol:
+                    sanitized_symbol_offset = offset
+                    break
 
         if sanitized_symbol:
             ref = self.normalize_ref(sanitized_symbol[1],
-                                     sanitized_symbol[0])
-        elif ADDR_RE.match(norm_addr):
-            if norm_addr.startswith('00'):
-                ref = '#$%s' % norm_addr[2:]
-            else:
-                ref = '#$%s' % norm_addr
+                                     sanitized_symbol[0],
+                                     offset=sanitized_symbol_offset)
         else:
-            ref = addr_str
+            norm_addr = norm_addr_str
+
+            if ADDR_RE.match(norm_addr):
+                if norm_addr.startswith('00'):
+                    ref = '$%s' % norm_addr[2:]
+                else:
+                    ref = '$%s' % norm_addr
+            else:
+                ref = addr_str
 
         return ref
 
@@ -1647,6 +1700,7 @@ class BlockExporter:
         self,
         ref,              # type: str
         block_name=None,  # type: str | None
+        offset=0,         # type: int
     ):  # type: (...) -> str
         if ref.startswith('{{@SYMBOL:'):
             return ref
@@ -1656,6 +1710,8 @@ class BlockExporter:
         if ref.endswith('_1'):
             ref = ref[:-2]
             suffix = '+1'
+        elif offset:
+            suffix = '+%s' % offset
 
         if block_name is None:
             symbol = self.exporter.find_symbol_for_address(ref)
@@ -1688,6 +1744,7 @@ class BlockExporter:
 
         if is_array or isinstance(data_type, (Structure, Union)):
             count = data.getNumComponents()
+            print('***', index_path, count)
 
             for i in range(count):
                 child = data.getComponent(i)
@@ -1708,6 +1765,11 @@ class BlockExporter:
                 data_bytes = data.getBytes()
             else:
                 data_bytes = [None] * data_len
+
+            #assert data_len in (1, 2), (
+            #    'data_len = %r, byte_addr = %r, data_type = %r' % (
+            #        data_len, byte_addr, data_type,
+            #))
 
             if data_type_str in {'pointer', 'short', 'ushort'}:
                 # We'll need to specially output these as shorts.
@@ -1753,12 +1815,17 @@ class BlockExporter:
 
         exporter = self.exporter
         listing = exporter.listing
-        ref_manager = exporter.ref_manager
-        symbol_table = exporter.symbol_table
 
         bytes_writer = self.bytes_writer
         end_addr = self.end_addr
-        check_jump_tables = data_type_str in {'pointer', 'ushort'}
+        check_jump_tables = data_type_str in {'byte', 'pointer', 'ushort'}
+        code_op = 'XXX'
+
+        if check_jump_tables:
+            if data_type_str == 'byte':
+                code_op = 'db'
+            else:
+                code_op = 'dw'
 
         if index_path and data_type_str != 'char':
             comment_prefix = ''.join(
@@ -1770,9 +1837,34 @@ class BlockExporter:
             comment_prefix = ''
             default_comment_suffix = data_type_str
 
-        for value in data_values:
-            labeled = self.export_labels_and_comments(addr, writer)
+        data_dest_name_prefix = ''
+        norm_jump_table_addr = lambda offset: offset
+
+        for value_i, value in enumerate(data_values):
+            labels_comments = self.export_labels_and_comments(addr, writer)
+            labeled = bool(labels_comments)
+
             comment_suffix = listing.getComment(CodeUnit.EOL_COMMENT, addr)
+
+            if (check_jump_tables and
+                labeled and
+                value_i == 0 and
+                labels_comments['labels'] and
+                data_type_str == 'byte'):
+                # We may need a prefix for any references.
+                label = labels_comments['labels'][0]
+
+                if label.endswith('_L'):
+                    data_dest_name_prefix = '<'
+                    norm_jump_table_addr = lambda offset: (offset & 0xFF)
+                    print(label, 'Is <')
+                elif label.endswith('_U'):
+                    data_dest_name_prefix = '>'
+                    norm_jump_table_addr = \
+                        lambda offset: ((offset & 0xFF00) >> 2)
+                    print(label, 'Is >')
+
+                print(data_values)
 
             if comment_prefix or comment_suffix:
                 eol_comment = '%s%s' % (
@@ -1783,47 +1875,69 @@ class BlockExporter:
                 eol_comment = ''
 
             if not eol_comment:
-                # See if this value references another address.
-                refs = ref_manager.getReferencesFrom(addr)
+                ref_str = self.get_ref_str_from_addr(addr)
 
-                if refs:
-                    assert len(refs) == 1
-
-                    to_addr = refs[0].getToAddress()
-                    symbol = symbol_table.getPrimarySymbol(to_addr)
-
-                    if symbol is not None:
-                        eol_comment = (
-                            '%s [$%s]'
-                            % (self.normalize_ref(
-                                   symbol.getName(True),
-                                   exporter.get_block_name_for_addr(addr)),
-                               addr.toString())
-                        )
+                if ref_str:
+                    eol_comment = '%s [$%s]' % (ref_str, addr.toString())
 
             output_bytes = True
 
             # Specially handle references to functions for jump tables.
             if check_jump_tables:
-                jump_dest_func = self._find_func_ref_from(addr)
+                # If we're checking jump tables, look for any references
+                # from this address to consider using as a constant. This
+                # supports functions and symbols.
+                #
+                # Functions can be a direct reference or off by one. Other
+                # symbols must be direct reference.
+                jump_dest = self._find_data_target_ref_from(addr)
+                dest_name = None
 
-                if jump_dest_func is not None:
+                if 0 and 'PRG12' in addr.toString():
+                    print('%r -- %r -- %r' % (value, addr, jump_dest))
+
+                if jump_dest is not None:
                     bytes_writer.flush()
-                    jump_dest_func_addr = \
-                        jump_dest_func.getEntryPoint()
-                    jump_dest_func_addr_value = \
-                        jump_dest_func_addr.getUnsignedOffset()
 
-                    dest_name = jump_dest_func.getName()
+                    if isinstance(jump_dest, Function):
+                        jump_dest_addr = jump_dest.getEntryPoint()
+                        jump_dest_addr_value = \
+                            jump_dest_addr.getUnsignedOffset()
+                        deltas = [0, -1]
+                    else:
+                        jump_dest_addr = jump_dest.getAddress()
+                        jump_dest_addr_value = \
+                            jump_dest_addr.getUnsignedOffset()
+                        deltas = [0]
 
-                    if jump_dest_func_addr_value - 1 == value:
-                        dest_name = '%s-1' % self.normalize_ref(
-                            dest_name,
-                            exporter.get_block_name_for_addr(
-                                jump_dest_func_addr))
+                    for delta in deltas:
+                        jump_table_offset = norm_jump_table_addr(
+                            jump_dest_addr_value + delta)
 
+                        if self.block_name == 'PRG12':
+                            print(addr, jump_dest,
+                                  norm_jump_table_addr,
+                                  repr(jump_dest_addr_value + delta),
+                                  repr(jump_table_offset),
+                                  '%s == %s ?' % (jump_table_offset, value))
+
+                        if jump_table_offset == value:
+                            dest_name = exporter.sanitize_label_name(
+                                jump_dest.getName())
+
+                            dest_name = '%s%s%s' % (
+                                data_dest_name_prefix,
+                                self.normalize_ref(
+                                    dest_name,
+                                    exporter.get_block_name_for_addr(
+                                        jump_dest_addr)),
+                                delta or '',
+                            )
+                            break
+
+                if dest_name:
                     writer.write_code(
-                        ['dw', dest_name],
+                        [code_op, dest_name],
                         addr=addr,
                         eol_comment=self.process_comment(eol_comment))
 
@@ -1846,13 +1960,14 @@ class BlockExporter:
             except Exception:
                 break
 
-    def _find_func_ref_from(
+    def _find_data_target_ref_from(
         self,
         addr,  # type: Address
     ):  # type: (...) -> Function | None
         exporter = self.exporter
         func_manager = exporter.func_manager
         ref_manager = exporter.ref_manager
+        symbol_table = exporter.symbol_table
 
         for ref in ref_manager.getReferencesFrom(addr):
             to_addr = ref.getToAddress()
@@ -1864,6 +1979,9 @@ class BlockExporter:
 
             if func:
                 return func
+
+            for symbol in symbol_table.getSymbols(to_addr):
+                return symbol
 
         return None
 
@@ -2064,6 +2182,8 @@ class Exporter:
         if block.getSize() <= 0:
             return
 
+        self.block = block
+
         block_exporter = BlockExporter(block=block,
                                        exporter=self)
         writer = MultiFileWriter(base_path=base_path,
@@ -2141,7 +2261,7 @@ class Exporter:
 
     def get_block_name_for_addr(
         self,
-        addr,  # typing: Address | str
+        addr,  # type: Address | str
     ):  # type: (...) -> str
         if isinstance(addr, Address):
             addr = addr.getAddressSpace().toString()
